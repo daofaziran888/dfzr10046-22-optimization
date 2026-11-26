@@ -41,13 +41,22 @@
       <thead>
         <tr>
           <th v-for="column in meta.fields" :key="column">{{ column }}</th>
+          <th v-if="meta.key === 'scd_chain'">闭链编号</th>
           <th>当前状态</th>
           <th>可执行动作</th>
         </tr>
       </thead>
       <tbody>
-        <tr v-for="row in rows" :key="String(row.id)" :data-testid="`row-${row.id}`" :data-status="String(row.status)">
+        <tr
+          v-for="row in rows"
+          :key="String(row.id)"
+          :data-testid="`row-${row.id}`"
+          :data-status="String(row.status)"
+          :class="{ 'row-selected': meta.key === 'scd_chain' && selectedChainId === row['拉链编号'] }"
+          @click="selectRow(row)"
+        >
           <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
+          <td v-if="meta.key === 'scd_chain'" data-testid="row-closure-no">{{ row['闭链编号'] ?? '—' }}</td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
             <button
@@ -69,6 +78,13 @@
         </tr>
       </tbody>
     </table>
+
+    <ClosurePanel
+      v-if="meta.key === 'scd_chain'"
+      ref="closurePanel"
+      :default-chain-id="selectedChainId"
+    />
+    <SnapshotClosurePanel v-if="meta.key === 'dim_snapshot'" />
 
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
@@ -103,6 +119,9 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import { markChainConflict } from '@/api/closure'
+import ClosurePanel from '@/components/ClosurePanel.vue'
+import SnapshotClosurePanel from '@/components/SnapshotClosurePanel.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
@@ -115,6 +134,8 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const selectedChainId = ref('')
+const closurePanel = ref<InstanceType<typeof ClosurePanel> | null>(null)
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -129,6 +150,12 @@ const statusSummary = computed(() =>
     count: rows.value.filter((row) => String(row.status) === status).length,
   })),
 )
+
+function selectRow(row: EntryRow) {
+  if (props.moduleKey === 'scd_chain') {
+    selectedChainId.value = String(row['拉链编号'] ?? '')
+  }
+}
 
 function resetFilters() {
   filters.value = {}
@@ -168,9 +195,23 @@ async function submitCreate() {
 async function runAction(action: string, row: EntryRow) {
   errorMessage.value = ''
   try {
-    const result = await applyAction(meta.key, Number(row.id), action)
-    if (!result.ok) throw new Error(result.message)
+    // 拉链「标记冲突」走闭链协作接口，确保在途闭链与送交结论同步失效并留痕。
+    if (props.moduleKey === 'scd_chain' && action === '标记冲突') {
+      const chainId = String(row['拉链编号'] ?? '')
+      const result = await markChainConflict(chainId, String(row['冲突原因'] ?? '页面标记区间冲突'))
+      if (!result.ok) throw new Error(result.message)
+      errorMessage.value = result.message
+      selectedChainId.value = chainId
+    } else {
+      const result = await applyAction(meta.key, Number(row.id), action)
+      if (!result.ok) throw new Error(result.message)
+    }
+    // 提交动作后除刷新列表外，拉链页同步刷新闭链核对面板，便于继续核对是否生效。
     await reload()
+    if (props.moduleKey === 'scd_chain') {
+      selectedChainId.value = String(row['拉链编号'] ?? selectedChainId.value)
+      await closurePanel.value?.recover()
+    }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '操作失败'
   }
@@ -189,3 +230,11 @@ async function reload() {
 
 onMounted(reload)
 </script>
+
+<style scoped>
+.data-table tr.row-selected {
+  background: #eff6ff;
+  outline: 2px solid var(--brand);
+  outline-offset: -2px;
+}
+</style>
